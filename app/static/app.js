@@ -30,7 +30,9 @@ const state = {
   cards: [],
   groups: [],      // 主持人：全部参与组；参与者：仅本组；观察者：分享所选组
   shares: [],      // 主持人：全部观察分享（有效/失效）
+  anchors: [],     // 主持人：全部轮次的复盘锚点（参与者/观察者永远为空）
   groupId: null,   // 参与者本组 id（主持人/观察者为 null）
+  round: 0,        // 当前演练轮次（= 此前 reset 次数；快照权威下发，reset 事件 +1）
   lastEventId: 0,
   clock: { status: 'idle', elapsedMs: 0, syncedAt: performance.now() },
   ws: null,
@@ -616,11 +618,91 @@ function updateShareCountdowns() {
   if (flip) renderShares();
 }
 
+/* ---------------------------------------------------------- 复盘锚点 */
+
+/* 主持人：按 (轮次, 虚拟毫秒, id) 列出全部锚点；旧轮次锚点标记「第 N 轮」。
+   服务端已保证锚点仅主持人可见（快照字段与 anchor_* 事件都按视野过滤）。 */
+function renderAnchors() {
+  if (state.role !== 'host') return;
+  const list = $('#anchor-list');
+  list.innerHTML = '';
+  $('#anchors-empty').classList.toggle('hidden', state.anchors.length > 0);
+  const ordered = [...state.anchors].sort(
+    (a, b) => a.round - b.round || a.vtime_ms - b.vtime_ms || a.id - b.id);
+  for (const a of ordered) {
+    const li = document.createElement('li');
+    li.className = 'anchor-item' + (a.round < currentRound() ? ' is-old' : '');
+
+    const head = document.createElement('div');
+    head.className = 'anchor-item-head';
+    const title = document.createElement('span');
+    title.className = 'anchor-item-title';
+    title.textContent = `⚓ ${a.title}`;
+    head.appendChild(title);
+    if (a.round < currentRound()) {
+      const rt = document.createElement('span');
+      rt.className = 'anchor-round-tag';
+      rt.textContent = `第 ${a.round + 1} 轮（历史）`;
+      head.appendChild(rt);
+    }
+    const tm = document.createElement('span');
+    tm.className = 'anchor-item-time';
+    tm.textContent = `T+${fmt(a.vtime_ms)}`;
+    head.appendChild(tm);
+    li.appendChild(head);
+
+    const note = document.createElement('div');
+    note.className = 'anchor-item-note' + (a.note ? '' : ' empty-note');
+    note.textContent = a.note || '（无备注）';
+    li.appendChild(note);
+
+    const meta = document.createElement('div');
+    meta.className = 'anchor-item-meta';
+    const info = document.createElement('span');
+    info.textContent = `第 ${a.round + 1} 轮 · 事件水位 #${a.event_id}` +
+      (a.updated_at && a.updated_at !== a.created_at ? ' · 备注已修改' : '');
+    meta.appendChild(info);
+    const ops = document.createElement('span');
+    ops.className = 'anchor-ops';
+    const edit = document.createElement('button');
+    edit.className = 'anchor-op';
+    edit.textContent = '修改备注';
+    edit.onclick = async () => {
+      const note2 = prompt('修改锚点备注（标题与绑定的轮次/时间/水位不可变）', a.note || '');
+      if (note2 === null || note2 === a.note) return;
+      try {
+        await api('PATCH', `/api/rooms/${state.code}/anchors/${a.id}`, { note: note2 });
+      } catch (err) { showError(err); }
+    };
+    ops.appendChild(edit);
+    const del = document.createElement('button');
+    del.className = 'anchor-op anchor-del';
+    del.textContent = '删除';
+    del.onclick = async () => {
+      if (!confirm(`删除锚点「${a.title}」？删除后不可恢复。`)) return;
+      try {
+        await api('DELETE', `/api/rooms/${state.code}/anchors/${a.id}`);
+      } catch (err) { showError(err); }
+    };
+    ops.appendChild(del);
+    meta.appendChild(ops);
+    li.appendChild(meta);
+
+    list.appendChild(li);
+  }
+}
+
+/* 当前轮次由快照权威下发（服务端按 reset 事件计数），reset 事件到达时 +1。 */
+function currentRound() {
+  return state.round;
+}
+
 function renderAll() {
   renderMeta();
   renderGroups();
   renderGateOptions();
   renderShares();
+  renderAnchors();
   renderCards();
 }
 
@@ -645,7 +727,9 @@ function applySnapshot(msg) {
   state.cards = msg.cards;
   state.groups = msg.groups || [];
   state.shares = msg.shares || []; // 仅主持人快照携带
+  state.anchors = msg.anchors || []; // 仅主持人快照携带；参与者/观察者字段缺省
   state.groupId = msg.scope && msg.scope.role === 'player' ? msg.scope.group_id : null;
+  state.round = Number.isInteger(msg.round) ? msg.round : 0;
   state.lastEventId = msg.last_event_id; // 权威水位
   syncClock(msg.room.status, msg.room.elapsed_ms);
   renderAll();
@@ -756,6 +840,18 @@ function applyEvent(msg) {
       if (s) s.status = msg.type === 'share_revoked' ? 'revoked' : 'expired';
       break;
     }
+    case 'anchor_created':
+      // 仅主持人会收到（服务端 event_visible 对 anchor_* 已过滤参与者/观察者）
+      if (!state.anchors.some((a) => a.id === p.id)) state.anchors.push(p);
+      break;
+    case 'anchor_updated': {
+      const a = state.anchors.find((x) => x.id === p.id);
+      if (a) Object.assign(a, p); // 仅备注/updated_at 会变；绑定字段不可变
+      break;
+    }
+    case 'anchor_deleted':
+      state.anchors = state.anchors.filter((a) => a.id !== p.id);
+      break;
     case 'clock':
       syncClock(p.status, p.elapsed_ms);
       break;
@@ -770,6 +866,7 @@ function applyEvent(msg) {
         if ('my_answer' in c) c.my_answer = null;
         c._answerWarn = false;
       });
+      state.round += 1; // 重置开启新一轮；锚点不清空，旧锚点仍归属原轮次
       syncClock('idle', 0);
       break;
   }
@@ -860,6 +957,8 @@ function enterRoom(code, role) {
   state.cards = [];
   state.groups = [];
   state.shares = [];
+  state.anchors = [];
+  state.round = 0;
   state.groupId = null;
   location.hash = `#/${role}/${code}`;
   localStorage.setItem(`inject-role-${code}`, role);
@@ -876,6 +975,8 @@ function enterObserver(token) {
   state.cards = [];
   state.groups = [];
   state.shares = [];
+  state.anchors = [];
+  state.round = 0;
   state.groupId = null;
   location.hash = `#/observe/${token}`;
   showRoom();
@@ -963,6 +1064,25 @@ $('#group-form').onsubmit = async (e) => {
     $('#group-name').value = '';
     $('#group-name').focus();
   } catch (err) { showError(err); }
+};
+
+/* 记录复盘锚点：任意状态可提交，服务端在状态锁内绑定当前轮次/虚拟毫秒/事件水位。
+   成功后由 anchor_created 事件（本连接也会收到广播）统一刷新，这里只清空表单。 */
+$('#anchor-form').onsubmit = async (e) => {
+  e.preventDefault();
+  const title = $('#anchor-title').value.trim();
+  if (!title) return;
+  const note = $('#anchor-note').value;
+  const btn = $('#anchor-form').querySelector('button[type=submit]');
+  btn.disabled = true;
+  try {
+    await api('POST', `/api/rooms/${state.code}/anchors`, { title, note });
+    $('#anchor-title').value = '';
+    $('#anchor-note').value = '';
+    $('#anchor-title').focus();
+  } catch (err) { showError(err); } finally {
+    btn.disabled = false;
+  }
 };
 
 $('#card-form').onsubmit = async (e) => {

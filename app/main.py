@@ -13,6 +13,10 @@
   生成可撤销的随机观察链接；观察者只读，仅能收到已揭示的全员卡片与
   所选组卡片，拿不到未揭示卡、房间码、组加入码、回执明细与控制能力；
   到期或撤销时立即断开在线观察者，凭证此后一律失效
+- 复盘锚点：主持人在任意状态记录标题/备注，服务端在同一把状态锁内把锚点
+  绑定到当前轮次、虚拟毫秒与当时事件水位（暂停期间冻结）；支持改备注/删除，
+  实时同步给主持人，参与者与观察者不可见；重置后锚点保留并归属原轮次；
+  导出复盘包按锚点创建事件水位截断，离线回放页可按锚点精确还原当时状态
 - 处置答复：参与者对本组可见且已揭示的卡片提交/修改一份组内答复，
   更新必须携带当前 revision，版本过期返回 409 与最新答复（防同组多窗口
   静默覆盖）；主持人可逐卡锁定/重新开放（锁定后参与者只读、写入 409），
@@ -118,6 +122,32 @@ def answer_public(answer: sqlite3.Row) -> dict:
         "body": answer["body"],
         "revision": answer["revision"],
         "updated_at": answer["updated_at"],
+    }
+
+
+def current_round(room_id: int) -> int:
+    """当前演练轮次 = 此前 reset 事件条数：每次重置结束上一轮并开启新一轮。
+
+    与 export 时间线（按 reset 切轮）同一口径；须在 state_lock 下调用。
+    """
+    return db.execute(
+        "SELECT COUNT(*) AS c FROM events WHERE room_id = ? AND type = 'reset'",
+        (room_id,),
+    ).fetchone()["c"]
+
+
+def anchor_public(anchor: sqlite3.Row) -> dict:
+    """复盘锚点序列化。仅主持人可见：快照与 anchor_* 事件都按主持人视野过滤。"""
+    return {
+        "id": anchor["id"],
+        "title": anchor["title"],
+        "note": anchor["note"],
+        "round": anchor["round"],
+        "vtime_ms": anchor["vtime_ms"],
+        "event_id": anchor["event_id"],   # 绑定水位：导出与离线回放截断到该事件
+        "created_event_id": anchor["created_event_id"],  # 自身创建事件 id
+        "created_at": anchor["created_at"],
+        "updated_at": anchor["updated_at"],
     }
 
 
@@ -317,6 +347,7 @@ def build_snapshot(room: sqlite3.Row, scope: int | None | ObserverScope) -> dict
             "kind": "snapshot",
             "last_event_id": last_id,
             "server_now_ms": now_ms(),
+            "round": current_round(room["id"]),  # 当前轮次（房间级，非敏感）
             "scope": {"role": "observer", "group_ids": gids},
             "room": room_public(room, include_code=False),       # 观察者拿不到房间码
             "groups": [{"id": g["id"], "name": g["name"]} for g in groups],  # 不含组加入码
@@ -345,6 +376,7 @@ def build_snapshot(room: sqlite3.Row, scope: int | None | ObserverScope) -> dict
         "kind": "snapshot",
         "last_event_id": last_id,
         "server_now_ms": now_ms(),
+        "round": current_round(room["id"]),  # 当前轮次（= 此前 reset 事件数）
         "scope": {"role": "host" if scope is None else "player", "group_id": scope},
         "room": room_public(room, include_code=scope is None),
         "groups": [group_public(g) for g in groups],
@@ -356,6 +388,13 @@ def build_snapshot(room: sqlite3.Row, scope: int | None | ObserverScope) -> dict
             "SELECT * FROM observer_shares WHERE room_id = ? ORDER BY id DESC", (room["id"],)
         ).fetchall()
         snapshot["shares"] = [share_public(s) for s in shares]
+        # 复盘锚点仅主持人可见：按 (轮次, 虚拟毫秒, id) 列出全部历史轮次的锚点。
+        # 重置不清锚点，旧轮次锚点仍归属原轮次保留。
+        anchors = db.execute(
+            "SELECT * FROM anchors WHERE room_id = ? ORDER BY round, vtime_ms, id",
+            (room["id"],),
+        ).fetchall()
+        snapshot["anchors"] = [anchor_public(a) for a in anchors]
     return snapshot
 
 
@@ -428,8 +467,8 @@ def event_visible(scope: int | None | ObserverScope, type_: str, payload: dict) 
     观察者只收已揭示卡片揭示/移除与房间级事件。"""
     if scope is None:
         return True
-    if type_.startswith("share_") or type_ == "gate_updated":
-        return False  # 分享凭证与门槛编排细节仅主持人可见
+    if type_.startswith("share_") or type_ == "gate_updated" or type_.startswith("anchor_"):
+        return False  # 分享凭证、门槛编排、复盘锚点均仅主持人可见
     if isinstance(scope, ObserverScope):
         if type_ in ("card_revealed", "card_removed", "answer_lock_updated"):
             gid = payload.get("group_id")
@@ -507,8 +546,8 @@ class Hub:
 hub = Hub()
 
 
-async def publish(code: str, room_id: int, type_: str, payload: dict) -> None:
-    """落库一条递增事件并按视野广播。必须在 state_lock 下调用。"""
+async def publish(code: str, room_id: int, type_: str, payload: dict) -> int:
+    """落库一条递增事件并按视野广播。必须在 state_lock 下调用。返回新事件 id。"""
     cur = db.execute(
         "INSERT INTO events (room_id, type, payload, created_at) VALUES (?, ?, ?, ?)",
         (room_id, type_, json.dumps(payload, ensure_ascii=False), time.time()),
@@ -521,6 +560,7 @@ async def publish(code: str, room_id: int, type_: str, payload: dict) -> None:
         "payload": payload,
         "server_now_ms": now_ms(),
     })
+    return cur.lastrowid
 
 
 # ---------------------------------------------------------------- 时钟 tick
@@ -1011,6 +1051,104 @@ async def observe_snapshot(token: str):
         return build_snapshot(room, observer_scope_from(share))
 
 
+# ---------------------------------------------------------------- REST：复盘锚点
+
+class AnchorIn(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    note: str = Field(default="", max_length=4000)
+
+
+class AnchorNoteIn(BaseModel):
+    note: str = Field(default="", max_length=4000)  # 锚点只允许修改备注，标题与绑定不可变
+
+
+def get_anchor_or_404(room_id: int, anchor_id: int) -> sqlite3.Row:
+    anchor = db.execute(
+        "SELECT * FROM anchors WHERE id = ? AND room_id = ?", (anchor_id, room_id)
+    ).fetchone()
+    if anchor is None:
+        raise HTTPException(status_code=404, detail="anchor not found")
+    return anchor
+
+
+@app.post("/api/rooms/{code}/anchors", status_code=201)
+async def create_anchor(code: str, body: AnchorIn):
+    """主持人记录复盘锚点：任意房间状态（待机/运行/暂停）均可。
+
+    绑定在同一把 state_lock 内原子完成，顺序严格为：先读当前轮次（此前 reset
+    计数），再读当时事件水位（MAX(events.id)，锚点自身事件尚未落库），再读
+    当前虚拟毫秒（running 结算当前运行段，paused/idle 取冻结值，暂停期间
+    时间天然冻结），然后插入锚点行，落库并广播 anchor_created（其 id 恰为
+    绑定水位 + 1），再把该事件 id 回填到行内 created_event_id。
+    导出按 created_event_id <= 导出水位截断（锚点是否已存在），离线回放按
+    event_id（绑定水位）截断；重置不删锚点，行内 round 使其归属原轮次。
+    """
+    async with state_lock:
+        room = get_room_or_404(code)
+        round_idx = current_round(room["id"])
+        high_water = db.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM events WHERE room_id = ?", (room["id"],)
+        ).fetchone()["m"]
+        vtime_ms = room_elapsed_ms(room)
+        now = time.time()
+        # 先以占位 created_event_id = 绑定水位插入（同一锁内不会有读者看到中间态），
+        # 随后落库 anchor_created 事件并把其自身事件 id 回填：导出按
+        # created_event_id <= 导出水位截断，回放按 event_id（绑定水位）截断。
+        cur = db.execute(
+            "INSERT INTO anchors (room_id, title, note, round, vtime_ms, event_id,"
+            " created_event_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (room["id"], body.title.strip(), body.note, round_idx, vtime_ms,
+             high_water, high_water, now, now),
+        )
+        anchor_id = cur.lastrowid
+        anchor = db.execute("SELECT * FROM anchors WHERE id = ?", (anchor_id,)).fetchone()
+        payload = anchor_public(anchor)
+        created_event_id = await publish(room["code"], room["id"], "anchor_created", payload)
+        db.execute(
+            "UPDATE anchors SET created_event_id = ? WHERE id = ?",
+            (created_event_id, anchor_id),
+        )
+        db.commit()
+        fresh = db.execute("SELECT * FROM anchors WHERE id = ?", (anchor_id,)).fetchone()
+        return anchor_public(fresh)
+
+
+@app.patch("/api/rooms/{code}/anchors/{anchor_id}")
+async def update_anchor_note(code: str, anchor_id: int, body: AnchorNoteIn):
+    """修改锚点备注（标题与创建时的轮次/虚拟毫秒/水位绑定不可变）。
+
+    变更落库并以 anchor_updated 实时同步给主持人；参与者与观察者不可见。
+    """
+    async with state_lock:
+        room = get_room_or_404(code)
+        anchor = get_anchor_or_404(room["id"], anchor_id)
+        now = time.time()
+        db.execute(
+            "UPDATE anchors SET note = ?, updated_at = ? WHERE id = ?",
+            (body.note, now, anchor["id"]),
+        )
+        db.commit()
+        fresh = db.execute("SELECT * FROM anchors WHERE id = ?", (anchor["id"],)).fetchone()
+        payload = anchor_public(fresh)
+        await publish(room["code"], room["id"], "anchor_updated", payload)
+        return payload
+
+
+@app.delete("/api/rooms/{code}/anchors/{anchor_id}")
+async def delete_anchor(code: str, anchor_id: int):
+    """删除锚点（主持人专属，幂等性通过 404 暴露不存在）。
+
+    删除持久化并以 anchor_deleted 实时同步；重置演练不会删除任何锚点。
+    """
+    async with state_lock:
+        room = get_room_or_404(code)
+        anchor = get_anchor_or_404(room["id"], anchor_id)
+        db.execute("DELETE FROM anchors WHERE id = ?", (anchor["id"],))
+        db.commit()
+        await publish(room["code"], room["id"], "anchor_deleted", {"id": anchor["id"]})
+        return {"ok": True, "id": anchor["id"]}
+
+
 # ---------------------------------------------------------------- REST：复盘包导出
 
 @app.get("/api/rooms/{code}/review.zip")
@@ -1119,6 +1257,8 @@ async def reset_room(code: str):
         )
         db.execute("DELETE FROM receipts WHERE room_id = ?", (room["id"],))
         db.execute("DELETE FROM answers WHERE room_id = ?", (room["id"],))
+        # 注意：anchors 表不在清理之列——复盘锚点跨重置保留，
+        # 并以行内 round 归属原轮次（当前轮次已由本 reset 事件 +1）。
         db.commit()
         payload = {"action": "reset", "status": "idle", "elapsed_ms": 0}
         await publish(room["code"], room["id"], "reset", payload)

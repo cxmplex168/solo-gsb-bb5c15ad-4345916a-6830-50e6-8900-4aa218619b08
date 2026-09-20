@@ -86,6 +86,27 @@
   .tag.recv { background:rgba(139,150,173,.15); color:var(--muted); }
   .empty { color:var(--muted); font-size:13px; }
   .two-col { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+
+  /* 复盘锚点 */
+  .anchor-groups { display:flex; flex-direction:column; gap:10px; }
+  .anchor-round-head { font-size:12px; color:var(--muted); margin:2px 0; }
+  .anchor-list { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:6px; }
+  .anchor-item { background:var(--panel-2); border:1px solid var(--border); border-left:4px solid var(--accent);
+                 border-radius:8px; padding:8px 12px; cursor:pointer; text-align:left; width:100%;
+                 color:var(--text); font-weight:400; }
+  .anchor-item:hover { border-color:var(--accent); background:#26314b; }
+  .anchor-item.active { border-left-color:var(--amber); border-color:var(--amber); }
+  .anchor-item-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .anchor-item-title { font-weight:700; font-size:13px; flex:1; min-width:0;
+                       overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .anchor-item-time { font-family:ui-monospace,monospace; font-size:11px; color:var(--accent); white-space:nowrap; }
+  .anchor-item-note { color:var(--muted); font-size:12px; margin-top:4px; white-space:pre-wrap; }
+  .anchor-item-meta { color:var(--muted); font-size:10px; margin-top:3px; font-family:ui-monospace,monospace; }
+  .cap-banner { display:none; margin-top:10px; padding:7px 12px; border-radius:6px;
+                background:rgba(245,185,66,.12); border:1px solid rgba(245,185,66,.4);
+                color:var(--amber); font-size:12px; align-items:center; gap:10px; flex-wrap:wrap; }
+  .cap-banner.on { display:flex; }
+  .cap-banner button { padding:3px 10px; font-size:12px; font-weight:400; }
   @media (max-width:760px) { .two-col { grid-template-columns:1fr; }
     .replay-bar { grid-template-columns:1fr; justify-items:stretch; }
     .clock-big { min-width:0; } }
@@ -128,6 +149,18 @@
         </select>
       </div>
     </div>
+    <div id="cap-banner" class="cap-banner">
+      <span id="cap-text"></span>
+      <button id="btn-clear-cap">返回完整水位视图</button>
+    </div>
+  </section>
+
+  <section class="panel" id="anchor-panel">
+    <h2>复盘锚点</h2>
+    <p class="hint">锚点在演练时由主持人记录，绑定所属轮次、虚拟毫秒与当时事件水位。
+      点击锚点：切换到对应轮次、滑块跳到绑定时间，并<strong>仅重放至锚点水位</strong>——
+      同一虚拟毫秒内 ID 更晚的事件不计入，精确还原锚点时刻状态。拖动滑块或切轮可退出锚点截断。</p>
+    <div id="anchor-groups" class="anchor-groups"></div>
   </section>
 
   <section class="panel">
@@ -219,11 +252,14 @@ window.__REVIEW_DATA__ = "__REPLAY_DATA_JSON__";
   /* 截至 (round, t) 的「持久编排」：纯事件重放——应用更早轮次的全部
      增删改事件 + 当前轮 vtime <= t 的事件，按事件 ID 升序。
      编排跨重置保留（reset 不产生组/卡片事件）；卡片仅在其删除事件
-     生效后消失，更早时刻仍可见；空演练（无任何编排事件）自然为空。 */
-  function applyEntities(round, t) {
+     生效后消失，更早时刻仍可见；空演练（无任何编排事件）自然为空。
+     capId 非 null 时再按事件 ID 截断（锚点还原：同刻更晚事件不计入）。
+     事件 ID 全局单调，更早轮次的事件 ID 必然更小，统一过滤安全。 */
+  function applyEntities(round, t, capId) {
     groups.clear(); cards.clear();
     D.events
-      .filter((e) => e.round < round || (e.round === round && e.vtime_ms <= t))
+      .filter((e) => (capId == null || e.id <= capId) &&
+        (e.round < round || (e.round === round && e.vtime_ms <= t)))
       .sort((a, b) => a.id - b.id)
       .forEach((e) => {
         const p = e.payload || {};
@@ -236,10 +272,13 @@ window.__REVIEW_DATA__ = "__REPLAY_DATA_JSON__";
       });
   }
 
-  /* 当前轮 [0, t] 的过程状态：揭示 / 回执 / 答复（含版本轨迹）/ 锁定 / 时钟 */
-  function roundState(round, t) {
+  /* 当前轮 [0, t] 的过程状态：揭示 / 回执 / 答复（含版本轨迹）/ 锁定 / 时钟。
+     capId 非 null（锚点还原）时，只消费 id <= capId 的事件——这精确还原
+     锚点绑定水位：即便另一事件与锚点同一虚拟毫秒，只要 ID 更晚也不计入。 */
+  function roundState(round, t, capId) {
     const evs = D.events
-      .filter((e) => e.round === round && e.vtime_ms <= t)
+      .filter((e) => (capId == null || e.id <= capId) &&
+        e.round === round && e.vtime_ms <= t)
       .sort((a, b) => a.id - b.id);
     const revealed = new Map();   // cardId -> card_revealed 载荷
     const receipts = new Map();   // cardId -> Map(gid -> bool)
@@ -308,6 +347,12 @@ window.__REVIEW_DATA__ = "__REPLAY_DATA_JSON__";
   const slider = $('#time-slider');
   const roundSelect = $('#round-select');
   let curRound = 0, curT = 0, playTimer = null;
+  let capAnchor = null;   // 锚点还原模式：当前绑定的锚点对象（null = 完整水位视图）
+
+  function anchorsOf(round) {
+    return (D.anchors || []).filter((a) => a.round === round)
+      .sort((a, b) => a.vtime_ms - b.vtime_ms || a.id - b.id);
+  }
 
   function rounds() { return D.rounds && D.rounds.length ? D.rounds : [{ round: 0, ended: false, end_ms: 0 }]; }
 
@@ -320,6 +365,7 @@ window.__REVIEW_DATA__ = "__REPLAY_DATA_JSON__";
       ['当前查看', `第 ${curRound + 1} 轮 · T+${fmt(curT)}`],
       ['编排卡片', `${(D.orchestration.cards || []).length} 张`],
       ['已揭示（水位）', `${(D.revealed_cards || []).length} 张`],
+      ['复盘锚点', `${(D.anchors || []).length} 个（本轮 ${anchorsOf(curRound).length}）`],
       ['时钟动作', `${(D.clock_actions || []).length} 个`],
     ];
     $('#meta-grid').innerHTML = rows.map(([k, v]) =>
@@ -350,14 +396,28 @@ window.__REVIEW_DATA__ = "__REPLAY_DATA_JSON__";
   }
 
   function renderState() {
-    applyEntities(curRound, curT);
-    const rs = roundState(curRound, curT);
+    // 锚点还原：所有状态推导只消费 id <= 锚点绑定水位 的事件
+    const capId = capAnchor ? capAnchor.event_id : null;
+    applyEntities(curRound, curT, capId);
+    const rs = roundState(curRound, curT, capId);
     $('#clock').textContent = fmt(curT);
     const st = rs.clock.action === null ? '待机（本轮尚未开始）'
       : ({ started: '进行中', paused: '已暂停', resumed: '进行中' })[rs.clock.action] || rs.clock.status;
     $('#clock-sub').textContent = st;
     $('#state-at').textContent =
-      `第 ${curRound + 1} 轮 · T+${fmt(curT)} / T+${fmt(rounds()[curRound].end_ms || 0)}`;
+      `第 ${curRound + 1} 轮 · T+${fmt(curT)} / T+${fmt(rounds()[curRound].end_ms || 0)}` +
+      (capAnchor ? ` · 锚点截断至事件 #${capAnchor.event_id}` : '');
+
+    // 锚点截断横幅：明确当前为「锚点时刻精确还原」而非完整水位视图
+    const banner = $('#cap-banner');
+    if (capAnchor) {
+      banner.classList.add('on');
+      $('#cap-text').textContent =
+        `⚓ 锚点「${capAnchor.title}」精确还原：第 ${curRound + 1} 轮 T+${fmt(curT)}，` +
+        `仅重放事件 #${capAnchor.event_id} 及之前（同一虚拟毫秒内更晚的事件不计入）。`;
+    } else {
+      banner.classList.remove('on');
+    }
 
     const list = $('#card-list');
     list.innerHTML = '';
@@ -478,7 +538,9 @@ window.__REVIEW_DATA__ = "__REPLAY_DATA_JSON__";
 
   function renderClockActions() {
     const host = $('#clock-actions');
-    const acts = D.clock_actions || [];
+    const capId = capAnchor ? capAnchor.event_id : null;
+    let acts = D.clock_actions || [];
+    if (capId != null) acts = acts.filter((a) => a.event_id <= capId);
     if (!acts.length) { host.innerHTML = '<p class="empty">本轮演练未操作过时钟。</p>'; return; }
     const label = { started: '开始', paused: '暂停', resumed: '继续', reset: '重置' };
     host.innerHTML = `<table><thead><tr><th>轮次</th><th>动作</th><th>虚拟时间</th><th>墙钟</th></tr></thead><tbody>` +
@@ -494,13 +556,16 @@ window.__REVIEW_DATA__ = "__REPLAY_DATA_JSON__";
 
   function renderEventLog() {
     const host = $('#event-log');
+    const capId = capAnchor ? capAnchor.event_id : null;
     const evs = D.events
-      .filter((e) => e.round === curRound && e.vtime_ms <= curT)
+      .filter((e) => (capId == null || e.id <= capId) &&
+        e.round === curRound && e.vtime_ms <= curT)
       .sort((a, b) => a.vtime_ms - b.vtime_ms || a.id - b.id); // 同一时刻按事件 ID 稳定排序
     if (!evs.length) { host.innerHTML = '<p class="empty">截至该虚拟时间尚无事件。</p>'; return; }
     host.innerHTML = `<table><thead><tr><th>虚拟时间</th><th>#</th><th>类型</th><th>内容</th></tr></thead><tbody>` +
       evs.map((e) => {
-        const exact = e.vtime_ms === curT;
+        // 锚点模式下高亮该轮最后一条被重放的事件（即锚点水位边界）
+        const exact = capId != null ? e.id === capId : e.vtime_ms === curT;
         return `<tr class="${exact ? 'at-t' : ''}">
           <td class="mono">T+${fmt(e.vtime_ms)}</td>
           <td class="mono">${e.id}</td>
@@ -509,28 +574,101 @@ window.__REVIEW_DATA__ = "__REPLAY_DATA_JSON__";
       }).join('') + '</tbody></table>';
   }
 
+  /* 复盘锚点：按轮次分组列出（只显示不晚于导出水位的锚点——data.anchors 已在服务端截断）。 */
+  function renderAnchors() {
+    const host = $('#anchor-groups');
+    const all = D.anchors || [];
+    if (!all.length) {
+      host.innerHTML = '<p class="empty">本复盘包不含锚点（导出时主持人尚未记录，或记录晚于导出水位）。</p>';
+      return;
+    }
+    host.innerHTML = '';
+    const byRound = new Map();
+    all.forEach((a) => {
+      if (!byRound.has(a.round)) byRound.set(a.round, []);
+      byRound.get(a.round).push(a);
+    });
+    [...byRound.keys()].sort((a, b) => a - b).forEach((rd) => {
+      const wrap = document.createElement('div');
+      const head = document.createElement('div');
+      head.className = 'anchor-round-head';
+      const meta = rounds()[rd];
+      head.textContent = `第 ${rd + 1} 轮${meta && meta.ended ? '（已重置结束）' : ''}` +
+        ` · ${byRound.get(rd).length} 个锚点`;
+      wrap.appendChild(head);
+      const ul = document.createElement('ul');
+      ul.className = 'anchor-list';
+      anchorsOf(rd).forEach((a) => {
+        const li = document.createElement('li');
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'anchor-item' +
+          (capAnchor && capAnchor.id === a.id ? ' active' : '');
+        btn.innerHTML =
+          `<div class="anchor-item-head">` +
+            `<span class="anchor-item-title">⚓ ${esc(a.title)}</span>` +
+            `<span class="anchor-item-time">T+${fmt(a.vtime_ms)}</span>` +
+          `</div>` +
+          (a.note ? `<div class="anchor-item-note">${esc(a.note)}</div>` : '') +
+          `<div class="anchor-item-meta">绑定事件水位 #${a.event_id}` +
+          (a.updated_at && a.updated_at !== a.created_at ? ' · 备注已修改' : '') + `</div>`;
+        btn.onclick = () => jumpToAnchor(a);
+        li.appendChild(btn);
+        ul.appendChild(li);
+      });
+      wrap.appendChild(ul);
+      host.appendChild(wrap);
+    });
+  }
+
   function renderAll() {
     renderMeta();
     renderSlider();
     renderState();
+    renderAnchors();
     renderClockActions();
     renderEventLog();
   }
 
   /* ---------------------------------------------------------- 交互 */
+
+  /* 点击锚点：切到绑定轮次、滑块跳到绑定虚拟毫秒、状态仅重放至锚点绑定水位。
+     不修改滑块 max（轮次跨度仍按导出水位）；只要不手动拖走，状态始终
+     按 capId 截断，精确还原同一虚拟时刻内的状态。 */
+  function jumpToAnchor(a) {
+    stopPlay();
+    curRound = Math.max(0, Math.min(a.round, rounds().length - 1));
+    roundSelect.value = String(curRound);
+    renderSlider();
+    capAnchor = a;
+    curT = a.vtime_ms;
+    slider.value = String(curT);
+    renderAll();
+  }
+
+  function clearCap() {
+    if (!capAnchor) return;
+    capAnchor = null;
+    renderAll();
+  }
+  $('#btn-clear-cap').onclick = clearCap;
+
   roundSelect.onchange = () => {
     curRound = parseInt(roundSelect.value, 10);
     curT = rounds()[curRound].end_ms || 0; // 切轮默认定位到该轮水位时刻
+    capAnchor = null;                      // 切轮退出锚点截断
     stopPlay();
     renderAll();
   };
-  slider.oninput = () => { stopPlay(); curT = parseInt(slider.value, 10); renderAll(); };
+  slider.oninput = () => { stopPlay(); capAnchor = null; curT = parseInt(slider.value, 10); renderAll(); };
 
   function stopPlay() {
     if (playTimer) { clearInterval(playTimer); playTimer = null; $('#btn-play').textContent = '▶ 播放'; }
   }
   $('#btn-play').onclick = () => {
     if (playTimer) { stopPlay(); return; }
+    capAnchor = null;  // 播放按完整水位走一遍，退出锚点截断
+    renderAnchors();
     const max = rounds()[curRound].end_ms || 0;
     if (curT >= max) curT = 0;
     $('#btn-play').textContent = '⏸ 暂停';

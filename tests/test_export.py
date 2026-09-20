@@ -336,8 +336,161 @@ def test_watermark_boundary():
     print("ok: watermark boundary excludes later events")
 
 
+def add_anchor(conn, room_id, title, round_idx, vtime_ms, event_id, note="", created=100.0):
+    """插入锚点行：event_id = 绑定水位；created_event_id 默认 = 绑定水位 + 1
+    （与服务端锁内「先读水位、再落自身创建事件」的真实关系一致）。"""
+    cur = conn.execute(
+        "INSERT INTO anchors (room_id,title,note,round,vtime_ms,event_id,created_event_id,"
+        "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (room_id, title, note, round_idx, vtime_ms, event_id, event_id + 1, created, created))
+    conn.commit()
+    return cur.lastrowid
+
+
+def test_anchors_export():
+    """复盘锚点：仅导出 event_id <= 水位者；按 (轮次, 虚拟毫秒, id) 排序；
+    锚点事件不进脱敏事件流；跨重置归属原轮次；备注修改随最新值导出。"""
+    with tempfile.TemporaryDirectory() as d:
+        conn = open_db(os.path.join(d, "t.db"))
+        rid = make_room(conn, "锚点演练")
+
+        e_start = add_event(conn, rid, 10.0, "clock",
+                            {"action": "started", "status": "running", "elapsed_ms": 0})
+        e_rev = add_event(conn, rid, 20.0, "card_revealed",
+                          {"id": 1, "seq": 1, "title": "卡", "group_id": None})
+        # 锚点 A：记录于 e_rev 之后（绑定水位 = e_rev，自身事件 = e_rev+1），虚拟 10s
+        a1 = add_anchor(conn, rid, "切流前", 0, 10000, e_rev, note="先观察", created=21.0)
+        e_a1_created = add_event(conn, rid, 21.0, "anchor_created",
+                                 {"id": a1, "round": 0, "vtime_ms": 10000, "event_id": e_rev})
+        assert e_a1_created == e_rev + 1  # 锁内绑定语义：自身事件恰为绑定水位 + 1
+        # 修改备注：事件与行更新都在，但导出的锚点备注须为最新
+        conn.execute("UPDATE anchors SET note=?, updated_at=? WHERE id=?",
+                     ("先观察，再确认回滚方案", 22.0, a1))
+        conn.commit()
+        e_a1_updated = add_event(conn, rid, 22.0, "anchor_updated", {"id": a1})
+        # 重置 → 第二轮
+        e_reset = add_event(conn, rid, 30.0, "reset",
+                            {"action": "reset", "status": "idle", "elapsed_ms": 0})
+        # 第二轮锚点 B：绑定水位 = e_reset，自身事件 = e_reset + 1
+        a2 = add_anchor(conn, rid, "第二轮起点", 1, 0, e_reset, created=40.0)
+        e_a2_created = add_event(conn, rid, 40.0, "anchor_created",
+                                 {"id": a2, "round": 1, "vtime_ms": 0, "event_id": e_reset})
+        # 锚点 C：在 B 的创建事件之后记录（自身事件 = e_a2_created + 1）——
+        # 水位若取 e_a2_created，C 尚未创建（created_event_id 更大），必须被排除
+        a3 = add_anchor(conn, rid, "晚于水位", 1, 5000, e_a2_created, created=41.0)
+        e_a3_created = add_event(conn, rid, 41.0, "anchor_created",
+                                 {"id": a3, "round": 1, "vtime_ms": 5000, "event_id": e_a2_created})
+
+        # 场景 1：水位 e_a1_updated（第二轮仅有 reset，锚点 B/C 均未创建）
+        room = conn.execute("SELECT * FROM rooms WHERE id=?", (rid,)).fetchone()
+        data = rv.build_review_data(conn, room, e_a1_updated)
+        anchors = data["anchors"]
+        assert [a["id"] for a in anchors] == [a1]
+        assert anchors[0]["note"] == "先观察，再确认回滚方案"
+        assert anchors[0]["round"] == 0 and anchors[0]["vtime_ms"] == 10000
+        assert anchors[0]["event_id"] == e_rev
+        assert anchors[0]["created_event_id"] == e_a1_created
+        # 锚点事件整类不进时间线
+        assert all(not e["type"].startswith("anchor_") for e in data["events"])
+        assert data["format_version"] >= 2
+
+        # 场景 2：水位 e_a2_created（B 已创建；C 的 created_event_id = e_a2_created+1，排除）
+        data2 = rv.build_review_data(conn, room, e_a2_created)
+        ids2 = [(a["id"], a["round"], a["vtime_ms"]) for a in data2["anchors"]]
+        assert ids2 == [(a1, 0, 10000), (a2, 1, 0)], ids2
+        assert all(a["id"] != a3 for a in data2["anchors"])
+        # B 的回放截断水位是 e_reset（点击 B 只重放到重置动作，不含任何第二轮新事件）
+        b2 = next(a for a in data2["anchors"] if a["id"] == a2)
+        assert b2["event_id"] == e_reset
+        # 轮次元数据：重置发生在第二轮
+        assert data2["rounds"][0]["ended"] is True
+
+        # 场景 3：完整水位（MAX id）：三个锚点全在（C 的 event_id = e_a2_created <= max）
+        high = conn.execute("SELECT MAX(id) m FROM events WHERE room_id=?", (rid,)).fetchone()["m"]
+        data3 = rv.build_review_data(conn, room, high)
+        assert {a["id"] for a in data3["anchors"]} == {a1, a2, a3}
+        # 排序 (round, vtime_ms, id)
+        keys = [(a["round"], a["vtime_ms"], a["id"]) for a in data3["anchors"]]
+        assert keys == sorted(keys)
+
+        # ZIP 内回放页含锚点数据与标题
+        blob = rv.build_review_zip(data3)
+        with zipfile.ZipFile(__import__("io").BytesIO(blob)) as zf:
+            html = zf.read("replay.html").decode("utf-8")
+            assert "切流前" in html and "第二轮起点" in html and "晚于水位" in html
+            again = json.loads(zf.read("data.json").decode("utf-8"))
+            assert {a["id"] for a in again["anchors"]} == {a1, a2, a3}
+        conn.close()
+    print("ok: anchors export watermark, ordering, rounds, note edit, zip")
+
+
+def test_legacy_db_migration_adds_anchors():
+    """旧库迁移：只有旧表、缺 anchors 表的库启动迁移后 anchors 可用；
+    旧卡片缺列补齐；既有演练视为没有任何锚点。"""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "old.db")
+        legacy = sqlite3.connect(path)
+        legacy.row_factory = sqlite3.Row
+        # 模拟最早期的旧库：rooms/groups/cards/events（cards 无任何新列）
+        legacy.executescript("""
+        CREATE TABLE rooms (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'idle',
+            elapsed_ms INTEGER NOT NULL DEFAULT 0, last_resume_at REAL, created_at REAL NOT NULL);
+        CREATE TABLE groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, room_id INTEGER NOT NULL,
+            name TEXT NOT NULL, join_code TEXT NOT NULL UNIQUE, created_at REAL NOT NULL);
+        CREATE TABLE cards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, room_id INTEGER NOT NULL,
+            seq INTEGER NOT NULL, trigger_seconds INTEGER NOT NULL,
+            title TEXT NOT NULL, content TEXT NOT NULL DEFAULT '');
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, room_id INTEGER NOT NULL,
+            type TEXT NOT NULL, payload TEXT NOT NULL, created_at REAL NOT NULL);
+        """)
+        legacy.execute(
+            "INSERT INTO rooms (code,name,status,created_at) VALUES ('OLD001','旧', 'paused', 1.0)")
+        legacy.execute(
+            "INSERT INTO cards (room_id,seq,trigger_seconds,title) VALUES (1,1,5,'老卡片')")
+        legacy.commit()
+        legacy.close()
+
+        # 走与启动完全一致的初始化路径
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        dbmod.init_schema(conn)
+
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(cards)")}
+        for needed in ("group_id", "depends_on_card_id", "gate_timeout_seconds",
+                       "timed_out", "answers_locked"):
+            assert needed in cols, f"legacy cards missing column {needed}"
+        # anchors 表由 SCHEMA 的 IF NOT EXISTS 补齐
+        names = {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert {"anchors", "answers", "observer_shares", "receipts"} <= names
+        n = conn.execute("SELECT COUNT(*) c FROM anchors").fetchone()["c"]
+        assert n == 0
+        # 旧库可以直接写入锚点并导出
+        now = time.time()
+        conn.execute(
+            "INSERT INTO anchors (room_id,title,note,round,vtime_ms,event_id,created_event_id,"
+            "created_at,updated_at) VALUES (1,'升级后锚点','',0,12000,0,0,?,?)", (now, now))
+        conn.commit()
+        room = conn.execute("SELECT * FROM rooms WHERE id=1").fetchone()
+        data = rv.build_review_data(conn, room, 0)
+        assert [a["title"] for a in data["anchors"]] == ["升级后锚点"]
+        # 停机时 running 房间冻结逻辑不影响 paused 旧房间
+        assert room["status"] == "paused"
+        conn.close()
+    print("ok: legacy db migration adds anchors table and missing card columns")
+
+
 if __name__ == "__main__":
     test_empty_drill()
     test_full_drill()
     test_watermark_boundary()
+    test_anchors_export()
+    test_legacy_db_migration_adds_anchors()
     print("ALL EXPORT TESTS PASSED")

@@ -89,6 +89,19 @@ CREATE TABLE IF NOT EXISTS observer_shares (
     created_at       REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS anchors (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id    INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    title      TEXT NOT NULL,
+    note       TEXT NOT NULL DEFAULT '',
+    round      INTEGER NOT NULL,                  -- 记录时绑定的轮次（= 此前 reset 事件数）
+    vtime_ms   INTEGER NOT NULL,                  -- 记录时绑定的虚拟时钟毫秒（暂停取冻结值）
+    event_id   INTEGER NOT NULL,                  -- 绑定的事件水位：创建事件落库前的 MAX(events.id)，离线回放截断到此
+    created_event_id INTEGER NOT NULL,            -- 其自身 anchor_created 事件 id；导出按它做水位截断
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_cards_due ON cards(room_id, revealed, trigger_seconds, seq);
 CREATE INDEX IF NOT EXISTS idx_cards_group ON cards(room_id, group_id);
 CREATE INDEX IF NOT EXISTS idx_cards_gate ON cards(depends_on_card_id);
@@ -98,6 +111,7 @@ CREATE INDEX IF NOT EXISTS idx_receipts_room ON receipts(room_id, card_id);
 CREATE INDEX IF NOT EXISTS idx_receipts_group ON receipts(group_id);
 CREATE INDEX IF NOT EXISTS idx_answers_room ON answers(room_id, card_id);
 CREATE INDEX IF NOT EXISTS idx_observer_shares_room ON observer_shares(room_id);
+CREATE INDEX IF NOT EXISTS idx_anchors_room ON anchors(room_id, round, vtime_ms, id);
 """
 
 
@@ -111,6 +125,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
     必须在 executescript(SCHEMA) 之前执行：SCHEMA 里的 idx_cards_group、
     idx_cards_gate 索引依赖这些列，旧库需先补列才能建索引。
+
+    复盘锚点表 anchors 为全新表（answers / observer_shares 同款），由
+    SCHEMA 中的 CREATE TABLE IF NOT EXISTS 直接在旧库补齐，无需额外迁移；
+    旧库既有演练视为没有任何锚点。重置不删锚点，升级后锚点仍按所属轮次保留。
     """
     table = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cards'"
@@ -118,6 +136,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if table is None:
         return  # 全新库：由 SCHEMA 一并建好，无需迁移
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(cards)")}
+    # 下列列在 SCHEMA 建索引（idx_cards_due 等）时必须已存在，旧库先补齐。
+    # 最早版本的 cards 表只有 id/room_id/seq/trigger_seconds/title/content，
+    # revealed/revealed_at_ms 与 group_id 等都是后续演进加入的。
+    if "revealed" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN revealed INTEGER NOT NULL DEFAULT 0")
+    if "revealed_at_ms" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN revealed_at_ms INTEGER")
     if "group_id" not in cols:
         conn.execute("ALTER TABLE cards ADD COLUMN group_id INTEGER REFERENCES groups(id)")
     if "depends_on_card_id" not in cols:

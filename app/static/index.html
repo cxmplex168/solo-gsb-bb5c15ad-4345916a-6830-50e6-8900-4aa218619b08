@@ -62,6 +62,19 @@
         ZIP 内为离线回放页 <code>replay.html</code>（双击即可打开，可拖动虚拟时间还原当时状态），
         已剔除房间码、组加入码与观察 token。</p>
 
+      <h3>复盘锚点</h3>
+      <p class="hint">任意状态（待机 / 运行 / 暂停）都可记录锚点：服务端在同一状态锁内把锚点绑定到
+        <strong>当前轮次、虚拟毫秒与当时事件水位</strong>，暂停期间虚拟时间冻结。锚点跨重置保留并归属原轮次，
+        仅主持人可见（参与者与观察者不可见），修改与删除实时同步。导出复盘包后，离线回放页可点击锚点
+        精确还原其绑定时刻状态。</p>
+      <form id="anchor-form" class="anchor-form">
+        <input id="anchor-title" type="text" placeholder="锚点标题，如：宣布切流前一刻" maxlength="120" required>
+        <textarea id="anchor-note" rows="2" placeholder="备注（可选）：现场判断、决策依据、待复盘问题…" maxlength="4000"></textarea>
+        <button type="submit" class="primary">记录锚点</button>
+      </form>
+      <p id="anchors-empty" class="hint">暂无锚点</p>
+      <ul id="anchor-list" class="anchor-list"></ul>
+
       <h3>参与组（<span id="group-count">0</span>/8）</h3>
       <p class="hint">每组一个加入码；参与者凭码进入后只能看到「全员」卡片与目标为本组的卡片。</p>
       <ul id="group-list" class="group-list"></ul>
