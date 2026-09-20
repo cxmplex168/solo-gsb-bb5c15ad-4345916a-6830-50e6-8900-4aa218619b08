@@ -336,8 +336,196 @@ def test_watermark_boundary():
     print("ok: watermark boundary excludes later events")
 
 
+def test_anchors_export():
+    """复盘锚点：按绑定事件水位过滤、跨重置归属原轮次、锚点事件不进事件流、ZIP 内含锚点。"""
+    with tempfile.TemporaryDirectory() as d:
+        conn = open_db(os.path.join(d, "t.db"))
+        t0 = 5000.0
+        rid = make_room(conn, "锚点演练")
+
+        g1 = conn.execute(
+            "INSERT INTO groups (room_id,name,join_code,created_at) VALUES (?,?,?,?)",
+            (rid, "红队", "CCC111", t0)).lastrowid
+        c1 = conn.execute(
+            "INSERT INTO cards (room_id,seq,trigger_seconds,title,group_id)"
+            " VALUES (?,?,?,?,?)", (rid, 1, 10, "卡片", None)).lastrowid
+        conn.commit()
+        e_g = add_event(conn, rid, t0 + 1, "group_added",
+                        {"id": g1, "name": "红队", "join_code": "CCC111"})
+        e_c = add_event(conn, rid, t0 + 2, "card_added",
+                        {"id": c1, "seq": 1, "trigger_seconds": 10, "title": "卡片",
+                         "group_id": None})
+
+        # 锚点 1：开始前（round 0, vtime 0, 水位 = e_c）
+        a1 = conn.execute(
+            "INSERT INTO anchors (room_id,round_index,vtime_ms,bound_event_id,"
+            "title,note,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (rid, 0, 0, e_c, "开始前检查", "确认全员就位", t0 + 3, t0 + 3)).lastrowid
+        # anchor_added 事件（id 在锚点绑定水位之后）——不应进入导出事件流
+        add_event(conn, rid, t0 + 3, "anchor_added",
+                  {"id": a1, "round": 0, "vtime_ms": 0, "bound_event_id": e_c,
+                   "title": "开始前检查"})
+
+        wall_start = t0 + 10
+        add_event(conn, rid, wall_start, "clock",
+                  {"action": "started", "status": "running", "elapsed_ms": 0})
+        conn.execute("UPDATE rooms SET status='running', elapsed_ms=0, last_resume_at=? WHERE id=?",
+                     (wall_start, rid))
+        conn.commit()
+        e_rev = add_event(conn, rid, wall_start + 10.0, "card_revealed",
+                          {"id": c1, "seq": 1, "trigger_seconds": 10, "title": "卡片",
+                           "group_id": None, "revealed": True, "revealed_at_ms": 10000,
+                           "timed_out": False, "answers_locked": False})
+
+        # 锚点 2：运行中 10s（round 0, vtime 10000, 水位 = e_rev）
+        a2 = conn.execute(
+            "INSERT INTO anchors (room_id,round_index,vtime_ms,bound_event_id,"
+            "title,note,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (rid, 0, 10000, e_rev, "揭示瞬间", "", wall_start + 10, wall_start + 10)).lastrowid
+        add_event(conn, rid, wall_start + 10.1, "anchor_added", {"id": a2})
+
+        # 暂停于 12s
+        conn.execute("UPDATE rooms SET status='paused', elapsed_ms=12000, last_resume_at=NULL WHERE id=?",
+                     (rid,))
+        conn.commit()
+        e_pause = add_event(conn, rid, wall_start + 12.0, "clock",
+                            {"action": "paused", "status": "paused", "elapsed_ms": 12000})
+
+        # 锚点 3：暂停期间——虚拟时间冻结于 12000；之后改备注
+        a3 = conn.execute(
+            "INSERT INTO anchors (room_id,round_index,vtime_ms,bound_event_id,"
+            "title,note,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (rid, 0, 12000, e_pause, "暂停复盘", "原备注", wall_start + 30, wall_start + 30)
+        ).lastrowid
+        e_a3add = add_event(conn, rid, wall_start + 30, "anchor_added", {"id": a3})
+        conn.execute("UPDATE anchors SET note=?, updated_at=? WHERE id=?",
+                     ("修改后的备注", wall_start + 40, a3))
+        conn.commit()
+        add_event(conn, rid, wall_start + 40, "anchor_updated", {"id": a3, "note": "修改后的备注"})
+
+        # 重置：锚点保留，新一轮从 0 起
+        conn.execute("UPDATE cards SET revealed=0, revealed_at_ms=NULL WHERE room_id=?", (rid,))
+        conn.execute("UPDATE rooms SET status='idle', elapsed_ms=0, last_resume_at=NULL WHERE id=?",
+                     (rid,))
+        conn.commit()
+        e_reset = add_event(conn, rid, wall_start + 50, "reset",
+                            {"action": "reset", "status": "idle", "elapsed_ms": 0})
+
+        # 锚点 4：重置后（round 1, vtime 0），绑定水位 = e_reset
+        a4 = conn.execute(
+            "INSERT INTO anchors (room_id,round_index,vtime_ms,bound_event_id,"
+            "title,note,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (rid, 1, 0, e_reset, "新一轮准备", "", wall_start + 60, wall_start + 60)).lastrowid
+        e_a4add = add_event(conn, rid, wall_start + 60, "anchor_added", {"id": a4})
+
+        # 锚点 5：未来锚点——绑定水位晚于即将使用的导出水位，导出时必须被排除
+        a5 = conn.execute(
+            "INSERT INTO anchors (room_id,round_index,vtime_ms,bound_event_id,"
+            "title,note,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (rid, 1, 0, e_a4add, "不该进包", "", wall_start + 70, wall_start + 70)).lastrowid
+        add_event(conn, rid, wall_start + 70, "anchor_added", {"id": a5})
+
+        # 导出水位卡在 e_a3add：锚点 1/2/3 入包；锚点 4（bound=e_reset > 水位）、
+        # 锚点 5（bound=e_a4add > 水位）均在水位之后记录，必须排除
+        room = conn.execute("SELECT * FROM rooms WHERE id=?", (rid,)).fetchone()
+        data = rv.build_review_data(conn, room, e_a3add)
+
+        anchors = data["anchors"]
+        by_id = {a["id"]: a for a in anchors}
+        assert set(by_id) == {a1, a2, a3}, set(by_id)
+        assert a4 not in by_id and a5 not in by_id
+        # 顺序：(round, vtime, id) —— 库内即按此序返回
+        assert [a["id"] for a in anchors] == [a1, a2, a3]
+        assert by_id[a1]["round"] == 0 and by_id[a1]["vtime_ms"] == 0
+        assert by_id[a2]["round"] == 0 and by_id[a2]["vtime_ms"] == 10000
+        assert by_id[a3]["round"] == 0 and by_id[a3]["vtime_ms"] == 12000
+        assert all(a["bound_event_id"] <= e_a3add for a in anchors)
+        # 备注为导出时刻最新值
+        assert by_id[a3]["note"] == "修改后的备注"
+
+        # anchor_* 事件整类不进脱敏事件流
+        assert all(not e["type"].startswith("anchor_") for e in data["events"])
+        # 脱敏：组加入码不泄露
+        assert "CCC111" not in json.dumps(data, ensure_ascii=False)
+
+        # ZIP 内 data.json 与 replay.html 都含锚点（且未来锚点不出现）
+        blob = rv.build_review_zip(data)
+        with zipfile.ZipFile(__import__("io").BytesIO(blob)) as zf:
+            dj = json.loads(zf.read("data.json").decode("utf-8"))
+            assert {a["id"] for a in dj["anchors"]} == {a1, a2, a3}
+            html = zf.read("replay.html").decode("utf-8")
+            assert "__REPLAY_DATA_JSON__" not in html
+            assert "暂停复盘" in html and "揭示瞬间" in html
+            assert "新一轮准备" not in html and "不该进包" not in html
+
+        # 水位取全局最大：未来锚点同样出现（不晚于导出水位即可）
+        high = conn.execute("SELECT MAX(id) m FROM events WHERE room_id=?", (rid,)).fetchone()["m"]
+        data2 = rv.build_review_data(conn, room, high)
+        assert {a["id"] for a in data2["anchors"]} == {a1, a2, a3, a4, a5}
+        conn.close()
+    print("ok: anchors export: watermark filter, round binding, frozen vtime, zip")
+
+
+def test_old_db_migration_creates_anchors():
+    """旧库（无 anchors 表）启动迁移后 anchors 表自动补建，既有数据完好。"""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "old.db")
+        old = sqlite3.connect(path)
+        # 模拟最早版本的精简结构：rooms/groups/cards/events，无任何新列新表
+        old.executescript(
+            """
+            CREATE TABLE rooms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'idle',
+                elapsed_ms INTEGER NOT NULL DEFAULT 0, last_resume_at REAL,
+                created_at REAL NOT NULL);
+            CREATE TABLE groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, room_id INTEGER NOT NULL,
+                name TEXT NOT NULL, join_code TEXT NOT NULL UNIQUE, created_at REAL NOT NULL);
+            CREATE TABLE cards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, room_id INTEGER NOT NULL,
+                seq INTEGER NOT NULL, trigger_seconds INTEGER NOT NULL,
+                title TEXT NOT NULL, content TEXT NOT NULL DEFAULT '',
+                revealed INTEGER NOT NULL DEFAULT 0, revealed_at_ms INTEGER);
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, room_id INTEGER NOT NULL,
+                type TEXT NOT NULL, payload TEXT NOT NULL, created_at REAL NOT NULL);
+            """
+        )
+        old.execute(
+            "INSERT INTO rooms (code,name,status,elapsed_ms,created_at) VALUES (?,?,?,?,?)",
+            ("OLD001", "旧库房间", "paused", 9000, 1.0))
+        old.commit()
+        old.close()
+
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        dbmod.init_schema(conn)  # 迁移 + 建表 + running 冻结（本库无 running）
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(cards)")}
+        for needed in ("group_id", "depends_on_card_id", "gate_timeout_seconds",
+                       "timed_out", "answers_locked"):
+            assert needed in cols, needed
+        names = {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        for needed in ("anchors", "answers", "observer_shares", "receipts"):
+            assert needed in names, needed
+        # 既有数据完好，且可直接写入锚点
+        room = conn.execute("SELECT * FROM rooms WHERE code='OLD001'").fetchone()
+        assert room["name"] == "旧库房间" and room["elapsed_ms"] == 9000
+        conn.execute(
+            "INSERT INTO anchors (room_id,round_index,vtime_ms,bound_event_id,"
+            "title,note,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (room["id"], 0, 9000, 0, "迁移后锚点", "", 2.0, 2.0))
+        conn.commit()
+        assert conn.execute("SELECT COUNT(*) c FROM anchors").fetchone()["c"] == 1
+        conn.close()
+    print("ok: old database migration creates anchors table")
+
+
 if __name__ == "__main__":
     test_empty_drill()
     test_full_drill()
     test_watermark_boundary()
+    test_anchors_export()
+    test_old_db_migration_creates_anchors()
     print("ALL EXPORT TESTS PASSED")

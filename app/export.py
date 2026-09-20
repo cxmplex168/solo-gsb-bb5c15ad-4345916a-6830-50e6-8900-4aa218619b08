@@ -12,6 +12,8 @@
 - receipts：水位时刻各卡各组回执
 - answers：水位时刻各卡各组最新答复
 - answer_versions：答复版本轨迹（由事件流重放得到，含历史版本正文）
+- anchors：复盘锚点（记录时固化的轮次/虚拟毫秒/事件水位；只含绑定水位
+  不晚于导出水位的锚点）
 - clock_actions：时钟动作轨迹（开始/暂停/继续/重置，附虚拟时间）
 - events：脱敏后的完整事件流（供离线回放页重建任意虚拟时刻状态）
 
@@ -29,7 +31,7 @@ import time
 import zipfile
 from pathlib import Path
 
-PACKAGE_FORMAT_VERSION = 1
+PACKAGE_FORMAT_VERSION = 2
 REPLAY_HTML_NAME = "replay.html"
 DATA_JSON_NAME = "data.json"
 
@@ -143,7 +145,8 @@ def _sort_timeline(timeline: list[dict], rounds: list[dict]) -> None:
 
 # ---------------------------------------------------------------- 脱敏事件
 
-# 可进入复盘包的事件类型白名单；share_*（含观察 token）一律剔除。
+# 可进入复盘包的事件类型白名单；share_*（含观察 token）与 anchor_*
+# （锚点经 anchors 专节导出，且不进入回放事件流）一律剔除。
 _EXPORTED_TYPES = {
     "group_added", "group_renamed", "group_removed",
     "card_added", "card_removed", "card_revealed",
@@ -290,6 +293,35 @@ def _answer_versions(conn: sqlite3.Connection, room_id: int, high_water: int) ->
     return versions
 
 
+def _anchors(conn: sqlite3.Connection, room_id: int, high_water: int) -> list[dict]:
+    """复盘锚点：只包含绑定水位不晚于导出水位的锚点。
+
+    锚点在记录瞬间于同一把状态锁内绑定当时事件水位（bound_event_id）与
+    虚拟毫秒；bound_event_id <= high_water 保证生成期间或之后新建的锚点
+    绝不混入。锚点的轮次与虚拟毫秒为记录时固化的历史事实，重置后仍归属
+    原轮次。备注取导出时刻的最新内容（anchor_* 事件整类不导出，锚点经
+    本专节进入复盘包，不经脱敏事件流）。
+    """
+    rows = conn.execute(
+        """SELECT id, round_index, vtime_ms, bound_event_id, title, note,
+                  created_at, updated_at
+           FROM anchors
+           WHERE room_id = ? AND bound_event_id <= ?
+           ORDER BY round_index, vtime_ms, id""",
+        (room_id, high_water),
+    ).fetchall()
+    return [{
+        "id": r["id"],
+        "round": r["round_index"],
+        "vtime_ms": r["vtime_ms"],
+        "bound_event_id": r["bound_event_id"],
+        "title": r["title"],
+        "note": r["note"],
+        "created_at": r["created_at"],
+        "updated_at": r["updated_at"],
+    } for r in rows]
+
+
 # ---------------------------------------------------------------- 组装
 
 def build_review_data(conn: sqlite3.Connection, room: sqlite3.Row, high_water: int) -> dict:
@@ -336,6 +368,7 @@ def build_review_data(conn: sqlite3.Connection, room: sqlite3.Row, high_water: i
         "receipts": _receipts(conn, room_id),
         "answers": _answers(conn, room_id),
         "answer_versions": _answer_versions(conn, room_id, high_water),
+        "anchors": _anchors(conn, room_id, high_water),
         "clock_actions": clock_actions,
         "events": timeline_out,
     }
@@ -386,6 +419,11 @@ _README_TXT = """\
 - replay.html  双击用浏览器打开即可进入回放页（所有资源均已内联，零外链）。
                顶部可切换演练轮次、拖动「虚拟时间」滑块还原当时状态；
                同一虚拟时刻的事件按事件 ID 稳定排序。
+               「复盘锚点」按轮次列出：点击锚点即跳到其绑定虚拟时间，
+               并仅重放至锚点绑定的事件水位，精确还原锚点瞬间
+               （同一虚拟时刻内水位之后的事件不参与）；拖动滑块或切轮
+               恢复完整水位回放。
 - data.json    复盘原始数据：房间编排、已揭示卡片、回执、答复版本轨迹、
+               复盘锚点（轮次/虚拟毫秒/绑定事件水位/标题/备注）、
                时钟动作与脱敏事件流（不含房间码、组加入码、观察 token）。
 """

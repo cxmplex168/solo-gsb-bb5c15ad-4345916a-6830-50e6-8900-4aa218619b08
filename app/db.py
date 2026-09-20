@@ -89,6 +89,18 @@ CREATE TABLE IF NOT EXISTS observer_shares (
     created_at       REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS anchors (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id        INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    round_index    INTEGER NOT NULL,                -- 记录时所属轮次（= 此前 reset 事件数）；重置后归属不变
+    vtime_ms       INTEGER NOT NULL,                -- 记录瞬间的虚拟时钟毫秒（暂停期间为冻结值，空闲为 0）
+    bound_event_id INTEGER NOT NULL,                -- 记录瞬间事件水位（events 表 MAX(id)），回放精确还原点
+    title          TEXT NOT NULL,
+    note           TEXT NOT NULL DEFAULT '',        -- 主持人可反复修改的备注
+    created_at     REAL NOT NULL,
+    updated_at     REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_cards_due ON cards(room_id, revealed, trigger_seconds, seq);
 CREATE INDEX IF NOT EXISTS idx_cards_group ON cards(room_id, group_id);
 CREATE INDEX IF NOT EXISTS idx_cards_gate ON cards(depends_on_card_id);
@@ -98,6 +110,7 @@ CREATE INDEX IF NOT EXISTS idx_receipts_room ON receipts(room_id, card_id);
 CREATE INDEX IF NOT EXISTS idx_receipts_group ON receipts(group_id);
 CREATE INDEX IF NOT EXISTS idx_answers_room ON answers(room_id, card_id);
 CREATE INDEX IF NOT EXISTS idx_observer_shares_room ON observer_shares(room_id);
+CREATE INDEX IF NOT EXISTS idx_anchors_room ON anchors(room_id, round_index, vtime_ms, id);
 """
 
 
@@ -108,6 +121,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     - depends_on_card_id / gate_timeout_seconds / timed_out：回执门槛，
       既有卡片一律视为无门槛；
     - answers_locked：处置答复锁定，既有卡片一律视为未锁定。
+
+    新增的整表（answers / observer_shares / anchors 等）全部带
+    CREATE TABLE IF NOT EXISTS，旧库执行 SCHEMA 时自动补建，锚点等
+    新功能无需额外 ALTER。
 
     必须在 executescript(SCHEMA) 之前执行：SCHEMA 里的 idx_cards_group、
     idx_cards_gate 索引依赖这些列，旧库需先补列才能建索引。

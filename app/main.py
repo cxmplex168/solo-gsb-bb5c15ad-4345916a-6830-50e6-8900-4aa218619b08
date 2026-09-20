@@ -121,6 +121,32 @@ def answer_public(answer: sqlite3.Row) -> dict:
     }
 
 
+def current_round_index(room_id: int) -> int:
+    """当前轮次序号 = 此前 reset 事件数；每次「重置」开启新一轮。
+
+    与导出端 _build_timeline 的轮次划分同口径：锚点在记录瞬间固化所属轮次，
+    之后无论再重置多少次都归属原轮次。
+    """
+    return db.execute(
+        "SELECT COUNT(*) AS c FROM events WHERE room_id = ? AND type = 'reset'",
+        (room_id,),
+    ).fetchone()["c"]
+
+
+def anchor_public(anchor: sqlite3.Row) -> dict:
+    """复盘锚点序列化。主持人专属：参与者与观察者的快照与事件都不含锚点。"""
+    return {
+        "id": anchor["id"],
+        "round": anchor["round_index"],
+        "vtime_ms": anchor["vtime_ms"],
+        "bound_event_id": anchor["bound_event_id"],
+        "title": anchor["title"],
+        "note": anchor["note"],
+        "created_at": anchor["created_at"],
+        "updated_at": anchor["updated_at"],
+    }
+
+
 def get_room_or_404(code: str) -> sqlite3.Row:
     room = db.execute("SELECT * FROM rooms WHERE code = ?", (code.upper(),)).fetchone()
     if room is None:
@@ -356,6 +382,12 @@ def build_snapshot(room: sqlite3.Row, scope: int | None | ObserverScope) -> dict
             "SELECT * FROM observer_shares WHERE room_id = ? ORDER BY id DESC", (room["id"],)
         ).fetchall()
         snapshot["shares"] = [share_public(s) for s in shares]
+        # 复盘锚点为主持人专属数据：按 (轮次, 虚拟毫秒, id) 稳定排列
+        anchors = db.execute(
+            "SELECT * FROM anchors WHERE room_id = ? ORDER BY round_index, vtime_ms, id",
+            (room["id"],),
+        ).fetchall()
+        snapshot["anchors"] = [anchor_public(a) for a in anchors]
     return snapshot
 
 
@@ -428,8 +460,8 @@ def event_visible(scope: int | None | ObserverScope, type_: str, payload: dict) 
     观察者只收已揭示卡片揭示/移除与房间级事件。"""
     if scope is None:
         return True
-    if type_.startswith("share_") or type_ == "gate_updated":
-        return False  # 分享凭证与门槛编排细节仅主持人可见
+    if type_.startswith("share_") or type_ == "gate_updated" or type_.startswith("anchor_"):
+        return False  # 分享凭证、门槛编排细节与复盘锚点均仅主持人可见
     if isinstance(scope, ObserverScope):
         if type_ in ("card_revealed", "card_removed", "answer_lock_updated"):
             gid = payload.get("group_id")
@@ -1009,6 +1041,85 @@ async def observe_snapshot(token: str):
         share = get_active_share_or_410(token)
         room = db.execute("SELECT * FROM rooms WHERE id = ?", (share["room_id"],)).fetchone()
         return build_snapshot(room, observer_scope_from(share))
+
+
+# ---------------------------------------------------------------- REST：复盘锚点
+
+class AnchorIn(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    note: str = Field(default="", max_length=4000)
+
+
+class AnchorNoteIn(BaseModel):
+    note: str = Field(max_length=4000)  # 锚点只允许改备注；轮次/虚拟毫秒/水位均为不可变历史
+
+
+@app.post("/api/rooms/{code}/anchors", status_code=201)
+async def create_anchor(code: str, body: AnchorIn):
+    """主持人在任意状态（空闲/运行/暂停/重置后）记录一个复盘锚点。
+
+    在 state_lock 内（与所有状态写操作同一把锁）先取当时事件水位
+    high_water = MAX(events.id)，再写入锚点并落 anchor_added 事件：
+    绑定水位严格早于本次锚点事件及之后的任何事件，暂停期间虚拟时钟
+    取冻结值（时间冻结），重置后锚点保留且 round_index 仍归属原轮次。
+    """
+    async with state_lock:
+        room = get_room_or_404(code)
+        high_water = db.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM events WHERE room_id = ?", (room["id"],)
+        ).fetchone()["m"]
+        vtime = room_elapsed_ms(room)  # running 结算本次运行段；paused/idle 取冻结值（暂停期间不推进）
+        round_index = current_round_index(room["id"])
+        now = time.time()
+        cur = db.execute(
+            "INSERT INTO anchors (room_id, round_index, vtime_ms, bound_event_id,"
+            " title, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (room["id"], round_index, vtime, high_water,
+             body.title.strip(), body.note, now, now),
+        )
+        db.commit()
+        anchor = db.execute("SELECT * FROM anchors WHERE id = ?", (cur.lastrowid,)).fetchone()
+        payload = anchor_public(anchor)
+        # anchor_* 事件仅主持人可见（event_visible 已过滤），参与者与观察者收不到
+        await publish(room["code"], room["id"], "anchor_added", payload)
+        return payload
+
+
+@app.patch("/api/rooms/{code}/anchors/{anchor_id}")
+async def update_anchor(code: str, anchor_id: int, body: AnchorNoteIn):
+    """修改锚点备注（标题与绑定的轮次/虚拟毫秒/水位不可变）。"""
+    async with state_lock:
+        room = get_room_or_404(code)
+        anchor = db.execute(
+            "SELECT * FROM anchors WHERE id = ? AND room_id = ?", (anchor_id, room["id"])
+        ).fetchone()
+        if anchor is None:
+            raise HTTPException(status_code=404, detail="anchor not found")
+        db.execute(
+            "UPDATE anchors SET note = ?, updated_at = ? WHERE id = ?",
+            (body.note, time.time(), anchor_id),
+        )
+        db.commit()
+        fresh = db.execute("SELECT * FROM anchors WHERE id = ?", (anchor_id,)).fetchone()
+        payload = anchor_public(fresh)
+        await publish(room["code"], room["id"], "anchor_updated", payload)
+        return payload
+
+
+@app.delete("/api/rooms/{code}/anchors/{anchor_id}")
+async def delete_anchor(code: str, anchor_id: int):
+    """删除锚点（幂等由 REST 语义保证：不存在返回 404）。"""
+    async with state_lock:
+        room = get_room_or_404(code)
+        anchor = db.execute(
+            "SELECT * FROM anchors WHERE id = ? AND room_id = ?", (anchor_id, room["id"])
+        ).fetchone()
+        if anchor is None:
+            raise HTTPException(status_code=404, detail="anchor not found")
+        db.execute("DELETE FROM anchors WHERE id = ?", (anchor_id,))
+        db.commit()
+        await publish(room["code"], room["id"], "anchor_removed", {"id": anchor_id})
+        return {"ok": True, "id": anchor_id}
 
 
 # ---------------------------------------------------------------- REST：复盘包导出

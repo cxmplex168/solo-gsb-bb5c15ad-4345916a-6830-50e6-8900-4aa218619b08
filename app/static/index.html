@@ -108,6 +108,23 @@
       </form>
     </section>
 
+    <!-- 复盘锚点（主持人专属） -->
+    <section id="anchor-panel" class="panel hidden">
+      <h2>复盘锚点</h2>
+      <p class="hint">在<strong>任意状态</strong>（开始前 / 运行中 / 暂停后 / 重置后）记录锚点：服务端在同一状态锁内
+        绑定<strong>当前轮次、虚拟毫秒与当时事件水位</strong>。暂停期间虚拟时间冻结；重置后锚点保留并归属原轮次。
+        锚点仅主持人可见，可改备注、可删除，变化实时同步。导出复盘包时只包含不晚于导出水位的锚点，
+        离线回放页点击锚点可精确还原锚点瞬间。</p>
+      <form id="anchor-form">
+        <input id="anchor-title" type="text" placeholder="锚点标题，如：宣布升级主库" required maxlength="200">
+        <textarea id="anchor-note" rows="2" placeholder="备注（可选，之后可随时修改）" maxlength="4000"></textarea>
+        <button type="submit" class="primary">记录锚点</button>
+        <span id="anchor-form-hint" class="hint"></span>
+      </form>
+      <p id="anchors-empty" class="hint">暂无锚点</p>
+      <ul id="anchor-list" class="anchor-list-live"></ul>
+    </section>
+
     <!-- 卡片列表 -->
     <section class="panel">
       <h2 id="cards-title">注入卡片</h2>

@@ -30,6 +30,7 @@ const state = {
   cards: [],
   groups: [],      // 主持人：全部参与组；参与者：仅本组；观察者：分享所选组
   shares: [],      // 主持人：全部观察分享（有效/失效）
+  anchors: [],     // 主持人：全部复盘锚点（跨轮次保留）；参与者/观察者永远为空
   groupId: null,   // 参与者本组 id（主持人/观察者为 null）
   lastEventId: 0,
   clock: { status: 'idle', elapsedMs: 0, syncedAt: performance.now() },
@@ -50,6 +51,7 @@ function showRoom() {
   $('#view-landing').classList.add('hidden');
   $('#view-room').classList.remove('hidden');
   $('#host-console').classList.toggle('hidden', state.role !== 'host');
+  $('#anchor-panel').classList.toggle('hidden', state.role !== 'host'); // 锚点仅主持人可见
   $('#cards-title').textContent =
     state.role === 'host' ? '注入卡片（全部）'
     : state.role === 'observer' ? '已揭示的情景注入（观察席 · 只读）'
@@ -616,11 +618,73 @@ function updateShareCountdowns() {
   if (flip) renderShares();
 }
 
+/* ---------------------------------------------------------- 复盘锚点（主持人专属） */
+
+function renderAnchors() {
+  if (state.role !== 'host') return;
+  const list = $('#anchor-list');
+  list.innerHTML = '';
+  $('#anchors-empty').classList.toggle('hidden', state.anchors.length > 0);
+  // 与导出/回放同口径：(轮次, 虚拟毫秒, id) 升序
+  const items = [...state.anchors].sort(
+    (a, b) => a.round - b.round || a.vtime_ms - b.vtime_ms || a.id - b.id);
+  for (const a of items) {
+    const li = document.createElement('li');
+    li.className = 'anchor-live-item';
+
+    const head = document.createElement('div');
+    head.className = 'anchor-live-head';
+    const title = document.createElement('span');
+    title.className = 'anchor-live-title';
+    title.textContent = a.title;
+    head.appendChild(title);
+    const meta = document.createElement('span');
+    meta.className = 'anchor-live-meta';
+    meta.innerHTML =
+      `<span class="anchor-round-tag">第 ${a.round + 1} 轮</span> · T+${fmt(a.vtime_ms)}` +
+      ` · 水位 #${a.bound_event_id}`;
+    head.appendChild(meta);
+    li.appendChild(head);
+
+    const note = document.createElement('div');
+    note.className = 'anchor-live-note' + (a.note ? '' : ' empty-note');
+    note.textContent = a.note || '（无备注）';
+    li.appendChild(note);
+
+    const ops = document.createElement('div');
+    ops.className = 'anchor-live-ops';
+    const edit = document.createElement('button');
+    edit.textContent = '改备注';
+    edit.onclick = async () => {
+      const next = prompt('修改锚点备注（轮次、虚拟时间与水位不可变）', a.note || '');
+      if (next === null || next === a.note) return;
+      try {
+        await api('PATCH', `/api/rooms/${state.code}/anchors/${a.id}`, { note: next });
+      } catch (err) { showError(err); }
+    };
+    ops.appendChild(edit);
+    const del = document.createElement('button');
+    del.className = 'anchor-del';
+    del.textContent = '删除';
+    del.onclick = async () => {
+      if (!confirm(`删除锚点「${a.title}」？该锚点不会进入之后导出的复盘包。`)) return;
+      try {
+        await api('DELETE', `/api/rooms/${state.code}/anchors/${a.id}`);
+      } catch (err) { showError(err); }
+    };
+    ops.appendChild(del);
+    li.appendChild(ops);
+
+    list.appendChild(li);
+  }
+}
+
 function renderAll() {
   renderMeta();
   renderGroups();
   renderGateOptions();
   renderShares();
+  renderAnchors();
   renderCards();
 }
 
@@ -645,6 +709,7 @@ function applySnapshot(msg) {
   state.cards = msg.cards;
   state.groups = msg.groups || [];
   state.shares = msg.shares || []; // 仅主持人快照携带
+  state.anchors = msg.anchors || []; // 仅主持人快照携带；参与者/观察者无此字段
   state.groupId = msg.scope && msg.scope.role === 'player' ? msg.scope.group_id : null;
   state.lastEventId = msg.last_event_id; // 权威水位
   syncClock(msg.room.status, msg.room.elapsed_ms);
@@ -756,6 +821,18 @@ function applyEvent(msg) {
       if (s) s.status = msg.type === 'share_revoked' ? 'revoked' : 'expired';
       break;
     }
+    case 'anchor_added':
+      // 仅主持人会收到（服务端 event_visible 已过滤 anchor_*）
+      if (!state.anchors.some((a) => a.id === p.id)) state.anchors.push(p);
+      break;
+    case 'anchor_updated': {
+      const a = state.anchors.find((x) => x.id === p.id);
+      if (a) Object.assign(a, p);
+      break;
+    }
+    case 'anchor_removed':
+      state.anchors = state.anchors.filter((a) => a.id !== p.id);
+      break;
     case 'clock':
       syncClock(p.status, p.elapsed_ms);
       break;
@@ -860,6 +937,7 @@ function enterRoom(code, role) {
   state.cards = [];
   state.groups = [];
   state.shares = [];
+  state.anchors = [];
   state.groupId = null;
   location.hash = `#/${role}/${code}`;
   localStorage.setItem(`inject-role-${code}`, role);
@@ -876,6 +954,7 @@ function enterObserver(token) {
   state.cards = [];
   state.groups = [];
   state.shares = [];
+  state.anchors = [];
   state.groupId = null;
   location.hash = `#/observe/${token}`;
   showRoom();
@@ -1012,6 +1091,19 @@ $('#share-form').onsubmit = async (e) => {
     renderShares();
     document.querySelectorAll('#share-groups input:checked').forEach((el) => { el.checked = false; });
     $('#share-minutes').value = 30;
+  } catch (err) { showError(err); }
+};
+
+$('#anchor-form').onsubmit = async (e) => {
+  e.preventDefault();
+  const title = $('#anchor-title').value.trim();
+  if (!title) return;
+  const note = $('#anchor-note').value;
+  try {
+    await api('POST', `/api/rooms/${state.code}/anchors`, { title, note });
+    $('#anchor-title').value = '';
+    $('#anchor-note').value = '';
+    $('#anchor-title').focus();
   } catch (err) { showError(err); }
 };
 
